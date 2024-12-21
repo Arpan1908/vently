@@ -90,19 +90,21 @@
 
 
 
+const { CartesiaClient } = require("@cartesia/cartesia-js");
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { createUser, getUserByEmail } = require('./models/User'); // Database functions
+const { createUser, getUserByEmail } = require('./models/User');
+const fs = require('fs');
+const { spawn } = require('child_process');
+const process = require('process');
 
 const app = express();
 const port = process.env.PORT || 5000;
-
-// Secret key for JWT (use environment variables for production)
-const JWT_SECRET = process.env.JWT_SECRET 
+const JWT_SECRET = process.env.JWT_SECRET;
 
 // Middleware
 app.use(cors());
@@ -112,12 +114,14 @@ app.use(express.json());
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
+// Initialize Cartesia client
+const cartesiaClient = new CartesiaClient({ apiKey: process.env.CARTESIA_API_KEY });
+
 // ----------------- AUTH ROUTES -----------------
 
-// Sign Up Route
 app.post('/signup', async (req, res) => {
   const { email, password } = req.body;
-
+  
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = await createUser(email, hashedPassword);
@@ -128,17 +132,16 @@ app.post('/signup', async (req, res) => {
   }
 });
 
-// Sign In Route
 app.post('/signin', async (req, res) => {
   const { email, password } = req.body;
-
+  
   try {
     const user = await getUserByEmail(email);
     if (!user) return res.status(400).json({ error: 'User not found' });
-
+    
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ error: 'Invalid credentials' });
-
+    
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '1h' });
     res.json({ message: 'Signed in successfully', token });
   } catch (error) {
@@ -147,31 +150,58 @@ app.post('/signin', async (req, res) => {
   }
 });
 
-// ----------------- CHAT ROUTE -----------------
+// ----------------- CHAT ROUTE WITH TTS -----------------
 
 app.post('/', async (req, res) => {
   const { message } = req.body;
 
-  // Predefined prompt to act as a therapist
   const prompt = `
-    You are a compassionate and empathetic Gen-Z therapist. Your goal is to provide thoughtful, supportive, and insightful responses to help the user work through their thoughts and feelings.
-    Respond with kindness, understanding, and guidance, using Gen-Z slang to keep them comfortable. Avoid repetitive words, and keep responses brief (1 or 2 sentences).
-
-    User: "${message}"
-    Therapist:
+  You are a compassionate and empathetic Gen-Z therapist. Your goal is to provide thoughtful, supportive, and insightful responses to help the user work through their thoughts and feelings.
+  Respond with kindness, understanding, and guidance, using Gen-Z slang to keep them comfortable. Avoid repetitive words.Learn from human interaction.Keep the conversation in 3 to 4 lines.
+  
+  User: "${message}"
+  Therapist:
   `;
 
   try {
-    const result = await model.generateContent(prompt);
-    const aiResponse = result.response.text();
+      // Generate AI response (text)
+      const result = await model.generateContent(prompt);
+      const aiResponse = result.response.text();
 
-    res.json({ reply: aiResponse });
+      // Generate voice using Cartesia TTS (raw PCM f32le)
+      const audioBuffer = await cartesiaClient.tts.bytes({
+      modelId: "sonic",
+      transcript: aiResponse,
+      voice: {
+        mode: "id",
+        id: "694f9389-aac1-45b6-b726-9d9369183238"
+      },
+      language: "en",
+      emotion:["positivity,curiosity"],
+      outputFormat: {
+        container: "wav",  // Changed to WAV format
+        encoding: "pcm_s16le",  // Changed to 16-bit PCM
+        sampleRate: 44100
+      }
+    });
+
+    const buffer = Buffer.from(audioBuffer);
+
+    // Set the headers for WAV audio
+    res.set({
+      'Content-Type': 'audio/wav',
+      'Content-Length': buffer.length,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'no-cache'
+    });
+
+    // Send the audio buffer
+    res.send(buffer);
   } catch (error) {
-    console.error('Error generating response:', error);
-    res.status(500).send('Error generating AI response');
+    console.error('Error generating audio:', error);
+    res.status(500).json({ error: 'Failed to generate audio' });
   }
 });
-
 // ----------------- SERVER START -----------------
 
 app.listen(port, () => {
